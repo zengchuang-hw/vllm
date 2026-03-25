@@ -1079,15 +1079,17 @@ def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
+    available_cpu_memory: int = 0,
 ) -> KVCacheConfig:
     """
-    Generate the KV cache configuration from the KV cache groups and spec
+    Generate KV cache configuration from the KV cache groups and spec
     of each layer.
 
     Args:
         vllm_config: The global VllmConfig
         kv_cache_groups: The KV cache groups
         available_memory: Memory available for KV cache in bytes
+        available_cpu_memory: CPU memory available for KV cache in bytes
     Returns:
         The generated KVCacheConfig
     """
@@ -1096,6 +1098,7 @@ def get_kv_cache_config_from_groups(
         # Return num_blocks=1 as BlockPool always needs a null_block.
         return KVCacheConfig(
             num_blocks=1,
+            num_cpu_blocks=0,
             kv_cache_tensors=[],
             kv_cache_groups=kv_cache_groups,
         )
@@ -1107,14 +1110,23 @@ def get_kv_cache_config_from_groups(
         # Special case: all layers have the same type of KV cache but with
         # different hidden size. Allocate different amount of memory for each
         # layer based on its hidden size.
-        num_blocks = (
+        num_gpu_blocks = (
             available_memory // kv_cache_groups[0].kv_cache_spec.page_size_bytes
         )
-        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        num_gpu_blocks = may_override_num_blocks(vllm_config, num_gpu_blocks)
+        
+        # Calculate num_cpu_blocks based on available_cpu_memory
+        num_cpu_blocks = 0
+        if available_cpu_memory > 0:
+            page_size = kv_cache_groups[0].kv_cache_spec.page_size_bytes
+            num_layers = len(kv_cache_groups[0].kv_cache_spec.kv_cache_specs)
+            num_cpu_blocks = int(available_cpu_memory // page_size // num_layers)
+            num_cpu_blocks = max(num_cpu_blocks, 0)
+        
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         kv_cache_tensors = [
             KVCacheTensor(
-                size=per_layer_specs[layer_name].page_size_bytes * num_blocks,
+                size=per_layer_specs[layer_name].page_size_bytes * num_cpu_blocks,
                 shared_by=[layer_name],
             )
             for layer_name in kv_cache_groups[0].layer_names
@@ -1134,9 +1146,16 @@ def get_kv_cache_config_from_groups(
             [group.kv_cache_spec for group in kv_cache_groups]
         )
         assert group_size > 0, "group_size must be greater than 0"
-        num_blocks = get_num_blocks(
+        num_gpu_blocks = get_num_blocks(
             vllm_config, group_size, available_memory, page_size
         )
+        
+        # Calculate num_cpu_blocks based on available_cpu_memory
+        num_cpu_blocks = 0
+        if available_cpu_memory > 0:
+            num_cpu_blocks = int(available_cpu_memory // page_size // group_size)
+            num_cpu_blocks = max(num_cpu_blocks, 0)
+        
         kv_cache_tensors = []
         for i in range(group_size):
             shared_by = []
@@ -1144,14 +1163,15 @@ def get_kv_cache_config_from_groups(
                 if i < len(kv_cache_groups[j].layer_names):
                     shared_by.append(kv_cache_groups[j].layer_names[i])
             kv_cache_tensors.append(
-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+                KVCacheTensor(size=page_size * num_cpu_blocks, shared_by=shared_by)
             )
 
     return KVCacheConfig(
-        num_blocks=num_blocks,
+        num_blocks=num_gpu_blocks,
+        num_cpu_blocks=num_cpu_blocks,
         kv_cache_tensors=kv_cache_tensors,
-        kv_cache_groups=kv_cache_groups,
-    )
+             kv_cache_groups=kv_cache_groups,
+         )
 
 
 def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
@@ -1297,7 +1317,7 @@ def _report_kv_cache_config(
 
     # Log the KV cache size and maximum concurrency.
     num_tokens = (
-        kv_cache_config.num_blocks
+        kv_cache_config.num_cpu_blocks
         // len(kv_cache_config.kv_cache_groups)
         * min_block_size
     )
@@ -1313,7 +1333,23 @@ def _report_kv_cache_config(
             dcp_size,
         )
     num_tokens_str = f"{num_tokens:,}"
-    logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
+    logger.info_once("CPU KV cache size: %s tokens", num_tokens_str, scope="local")
+    
+    # Log GPU KV cache size
+    num_gpu_tokens = (
+        kv_cache_config.num_blocks
+        // len(kv_cache_config.kv_cache_groups)
+        * min_block_size
+    )
+    num_gpu_tokens_str = f"{num_gpu_tokens:,}"
+    logger.info_once(f"Full GPU KV cache size: {num_gpu_tokens_str} tokens", scope="local")
+    
+    # Log block numbers
+    logger.info_once(
+        f"GPU block num: {kv_cache_config.num_blocks}  CPU block num: {kv_cache_config.num_cpu_blocks}",
+        scope="local"
+    )
+    
     max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
     max_concurrency = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config
@@ -1537,6 +1573,9 @@ def get_kv_cache_configs(
         The generated KVCacheConfigs for each worker.
     """
 
+    # Get available CPU memory from cache config (same for all workers)
+    available_cpu_memory = vllm_config.cache_config.swap_space_bytes
+
     # Merge the KV cache specs of all workers. Different PP stages may have
     # different layer names, and different TP ranks of the same PP stage should
     # have the same KV cache spec.
@@ -1589,7 +1628,8 @@ def get_kv_cache_configs(
         ), "Some layers are not assigned to any group."
         kv_cache_configs.append(
             get_kv_cache_config_from_groups(
-                vllm_config, projected_groups, available_memory_one_worker
+                vllm_config, projected_groups, available_memory_one_worker,
+                available_cpu_memory=available_cpu_memory
             )
         )
 
@@ -1599,9 +1639,13 @@ def get_kv_cache_configs(
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
     )
+    min_num_cpu_blocks = min(
+        kv_cache_config.num_cpu_blocks for kv_cache_config in kv_cache_configs
+    )
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
+        kv_cache_config.num_cpu_blocks = min_num_cpu_blocks
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:

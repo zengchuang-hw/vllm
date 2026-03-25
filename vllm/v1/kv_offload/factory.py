@@ -56,3 +56,7 @@ class OffloadingSpecFactory:
 OffloadingSpecFactory.register_spec(
     "CPUOffloadingSpec", "vllm.v1.kv_offload.cpu", "CPUOffloadingSpec"
 )
+# Register sparse-optimized CPU offloading spec
+OffloadingSpecFactory.register_spec(
+    "SparseCPUOffloadingSpec", "vllm.v1.kv_offload.sparse_cpu", "SparseCPUOffloadingSpec"
+)
