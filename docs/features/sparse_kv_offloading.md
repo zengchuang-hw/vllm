@@ -17,7 +17,8 @@ from vllm import LLM, SamplingParams
 llm = LLM(
     model="meta-llama/Llama-2-7b-hf",
     kv_transfer_config={
-        "kv_connector_type": "cpu",
+        "kv_connector": "OffloadingConnector",
+        "kv_role": "kv_both",
         "kv_connector_extra_config": {
             "spec_name": "SparseCPUOffloadingSpec",
             "cpu_bytes_to_use": 16 * 1024**3,

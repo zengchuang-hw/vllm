@@ -479,11 +479,11 @@ class KVCacheConfig:
 
     num_blocks: int
     """The number of KV cache blocks"""
-    num_cpu_blocks: int = 0
+    num_cpu_blocks: int
     """The number of CPU KV cache blocks"""
-    kv_cache_tensors: list[KVCacheTensor] = field(default_factory=list)
+    kv_cache_tensors: list[KVCacheTensor]
     """How should model runner initialize KV cache tensors for each layer"""
-    kv_cache_groups: list[KVCacheGroupSpec] = field(default_factory=list)
+    kv_cache_groups: list[KVCacheGroupSpec]
     """
     The kv cache groups of the model.
     For models with only one type of attention, there is only one group that
