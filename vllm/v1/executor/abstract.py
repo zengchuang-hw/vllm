@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from concurrent.futures import Future
-from typing import Callable, Union
+from typing import Callable, Dict, List, Type, Union, Optional
 
 import torch
 import torch.distributed as dist
@@ -14,6 +14,7 @@ from vllm.executor.uniproc_executor import (  # noqa
     UniProcExecutor as UniProcExecutorV0)
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.config import CopyMethod, CachePolicy
 
 FailureCallback = Callable[[], None]
 
@@ -87,12 +88,26 @@ class Executor(ExecutorBase):
                                      args=(scheduler_output, ))
         return output[0]
 
+    def init_gpu_cache_manager(self,
+                               num_gpu_cache_blocks: int,
+                               num_cpu_blocks: int,
+                               block_size: int,
+                               sparse_topk: Optional[int] = None,
+                               copy_method: CopyMethod = CopyMethod.MERGED,
+                               cache_policy: CachePolicy = CachePolicy.LRU_LAYERWISE) -> None:
+        self.collective_rpc("init_gpu_cache_manager",
+                            args=(num_gpu_cache_blocks, num_cpu_blocks, block_size, sparse_topk, copy_method, cache_policy))
+
+
     @property
     def max_concurrent_batches(self) -> int:
         return 1
 
     def profile(self, is_start: bool = True):
         self.collective_rpc("profile", args=(is_start, ))
+
+    def swap_blocks(self, d2h_map: Dict[int, int], h2d_map: Dict[int, int]):
+        self.collective_rpc("swap_blocks", args=(d2h_map, h2d_map))
 
 
 class UniProcExecutor(UniProcExecutorV0, Executor):

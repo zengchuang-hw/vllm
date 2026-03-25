@@ -77,11 +77,25 @@ class FlashAttentionMetadata:
 
     num_actual_tokens: int  # Number of tokens excluding padding.
     max_query_len: int
+    num_seqs: int
+
     query_start_loc: torch.Tensor
+    query_start_loc_cpu: torch.Tensor
+    query_start_loc_np: np.ndarray
+
     max_seq_len: int
+
     seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    seq_lens_np: np.ndarray
+
     block_table: torch.Tensor
+    block_table_cpu: torch.Tensor
+    block_table_np: np.ndarray
+
     slot_mapping: torch.Tensor
+    slot_mapping_cpu: torch.Tensor
+    slot_mapping_np: np.ndarray
 
     # For cascade attention.
     use_cascade: bool
@@ -96,6 +110,9 @@ class FlashAttentionMetadata:
 
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
+
+    # 每个 query token 的 in-block offset = slot_mapping % block_size
+    in_block_offset_np: Optional[np.ndarray] = None    
 
     # for local attention
     @dataclass
@@ -400,11 +417,20 @@ class FlashAttentionMetadataBuilder:
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
+            num_seqs=num_reqs,
             query_start_loc=query_start_loc,
+            query_start_loc_cpu=self.runner.query_start_loc_cpu,
+            query_start_loc_np=self.runner.query_start_loc_np,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
+            seq_lens_cpu=self.runner.seq_lens_cpu,
+            seq_lens_np=self.runner.seq_lens_np,
             block_table=block_table,
+            block_table_cpu=self.runner.input_batch.block_table.get_cpu_tensor(),
+            block_table_np=self.runner.input_batch.block_table.get_numpy_array(),
             slot_mapping=slot_mapping,
+            slot_mapping_cpu=self.runner.slot_mapping_cpu,
+            slot_mapping_np=self.runner.slot_mapping_np,
             use_cascade=use_cascade,
             common_prefix_len=common_prefix_len,
             scheduler_metadata=scheduler_metadata,
@@ -413,6 +439,7 @@ class FlashAttentionMetadataBuilder:
             suffix_kv_lens=suffix_kv_lens,
             local_attn_metadata=local_attn_metadata,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
+            in_block_offset_np=self.runner.block_offsets,
         )
         return attn_metadata
 
@@ -487,6 +514,9 @@ class FlashAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
         output: Optional[torch.Tensor] = None,
+        kv_swap_in_event: Optional[torch.cuda.Event] = None,
+        kv_update_event: Optional[torch.cuda.Event] = None,
+        main_stream: Optional[torch.cuda.Stream] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
 
@@ -524,6 +554,7 @@ class FlashAttentionImpl(AttentionImpl):
         # value[:num_actual_tokens] because the reshape_and_cache_flash op uses
         # the slot_mapping's shape to determine the number of actual tokens.
         key_cache, value_cache = kv_cache.unbind(0)
+
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key,
             value,
@@ -534,6 +565,13 @@ class FlashAttentionImpl(AttentionImpl):
             layer._k_scale,
             layer._v_scale,
         )
+
+        if kv_update_event is not None:
+            kv_update_event.record(main_stream)
+
+        # reshape 与 swap in 不应该冲突，swap in 的是已经生成过的 full blocks
+        if kv_swap_in_event is not None:
+            kv_swap_in_event.wait(main_stream)
 
         if self.kv_cache_dtype.startswith("fp8"):
             key_cache = key_cache.view(torch.float8_e4m3fn)
@@ -620,6 +658,14 @@ class FlashAttentionImpl(AttentionImpl):
             v_descale=layer._v_scale,
         )
         return output
+
+    @staticmethod
+    def swap_blocks(
+            src_kv_cache: torch.Tensor,
+            dst_kv_cache: torch.Tensor,
+            src_to_dst: torch.Tensor,
+    ) -> None:
+        return swap_blocks(src_kv_cache, dst_kv_cache, src_to_dst)
 
 
 def use_cascade_attention(
@@ -781,3 +827,16 @@ def cascade_attention(
     # Merge prefix and suffix outputs, and store the result in output.
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output,
                       suffix_lse)
+
+
+def swap_blocks(
+    src_kv_cache: torch.Tensor,
+    dst_kv_cache: torch.Tensor,
+    src_to_dst: torch.Tensor,
+) -> None:
+    src_key_cache = src_kv_cache[0]
+    dst_key_cache = dst_kv_cache[0]
+    ops.swap_blocks(src_key_cache, dst_key_cache, src_to_dst)
+    src_value_cache = src_kv_cache[1]
+    dst_value_cache = dst_kv_cache[1]
+    ops.swap_blocks(src_value_cache, dst_value_cache, src_to_dst)

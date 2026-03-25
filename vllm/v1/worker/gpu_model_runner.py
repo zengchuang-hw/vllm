@@ -3,7 +3,7 @@
 import gc
 import time
 import weakref
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union, List
 
 import numpy as np
 import torch
@@ -13,7 +13,7 @@ import torch.nn as nn
 from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
 from vllm.config import (CompilationLevel, VllmConfig,
-                         get_layers_from_vllm_config)
+                         get_layers_from_vllm_config, CopyMethod, CachePolicy)
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.parallel_state import get_pp_group, graph_capture
@@ -46,6 +46,7 @@ from vllm.v1.spec_decode.utils import is_spec_decode_supported
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.gpu_cache_manager import GPUCacheManager
 
 from .utils import (gather_mm_placeholders, sanity_check_mm_encoder_outputs,
                     scatter_mm_placeholders)
@@ -77,6 +78,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
+
+        self.gpu_cache_manager = None
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
         set_cpu_offload_max_bytes(
@@ -160,6 +163,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Lazy initialization
         # self.model: nn.Module  # Set after load_model
         self.kv_caches: list[torch.Tensor] = []
+        self.cpu_kv_caches: List[torch.Tensor] = []
         # req_id -> (input_id -> encoder_output)
         self.encoder_cache: dict[str, dict[int, torch.Tensor]] = {}
 
@@ -281,6 +285,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                         device="cpu",
                                         pin_memory=self.pin_memory)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
+
+        self.block_offsets = None
+
+    def init_gpu_cache_manager(self, num_gpu_cache_blocks: int, num_cpu_blocks: int, block_size: int, sparse_topk: Optional[int] = None,
+                               copy_method: CopyMethod = CopyMethod.MERGED,
+                               cache_policy: CachePolicy = CachePolicy.LRU_LAYERWISE):
+        assert self.gpu_cache_manager is None
+        self.gpu_cache_manager = GPUCacheManager(
+            num_gpu_cache_blocks=num_gpu_cache_blocks,
+            num_cpu_blocks=num_cpu_blocks,
+            num_layers=self.num_attn_layers,
+            block_size=block_size,
+            block_repr_tensor=torch.zeros((self.num_kv_heads, self.head_size),
+                                          dtype=self.model_config.dtype, device=self.device),
+            max_batch_size=self.max_num_reqs,
+            max_seq_len=self.max_model_len,
+            max_num_batch_tokens=self.max_num_tokens,
+            sparse_topk=sparse_topk,
+            copy_method=copy_method,
+            cache_policy=cache_policy,
+        )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -558,9 +583,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                positions_np // self.block_size)
         block_table_cpu = self.input_batch.block_table.get_cpu_tensor()
         block_numbers = block_table_cpu.flatten()[block_table_indices].numpy()
-        block_offsets = positions_np % self.block_size
+        self.block_offsets = positions_np % self.block_size
         np.add(block_numbers * self.block_size,
-               block_offsets,
+               self.block_offsets,
                out=self.slot_mapping_np[:total_num_scheduled_tokens])
 
         # Prepare the attention metadata.
@@ -588,6 +613,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Prepare for cascade attention if enabled & beneficial.
         common_prefix_len = 0
         if self.cascade_attn_enabled:
+            raise NotImplementedError(
+               "暂未支持 Cascade attention." 
+            )
             common_prefix_len = self._compute_cascade_attn_prefix_len(
                 num_scheduled_tokens,
                 scheduler_output.num_common_prefix_blocks,
@@ -1088,7 +1116,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
-        with set_forward_context(attn_metadata, self.vllm_config):
+        with set_forward_context(attn_metadata, self.vllm_config, self.gpu_cache_manager):
             output = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -1699,6 +1727,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "supported yet.")
 
         kv_caches: dict[str, torch.Tensor] = {}
+        cpu_kv_caches: dict[str, torch.Tensor] = {}
+
+        num_gpu_blocks = kv_cache_config.num_blocks
+        gpu_kv_cache = None
 
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group.kv_cache_spec
@@ -1713,24 +1745,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # different memory capacities, `num_blocks` can be different on
                 # different GPUs, and `kv_cache_config.num_blocks` is set to
                 # the min of all `num_blocks`. Verify it here.
-                assert num_blocks >= kv_cache_config.num_blocks
-                if isinstance(kv_cache_spec, AttentionSpec):
+                assert num_blocks >= kv_cache_config.num_cpu_blocks
+                if isinstance(kv_cache_spec, FullAttentionSpec):
+                    if gpu_kv_cache is None:
+                        kv_cache_shape = self.attn_backend.get_kv_cache_shape(num_gpu_blocks, 
+                                                                            kv_cache_spec.block_size, 
+                                                                            kv_cache_spec.num_kv_heads,
+                                                                            kv_cache_spec.head_size)
+                        dtype = kv_cache_spec.dtype
+                        gpu_kv_cache = torch.zeros(kv_cache_shape,
+                                                    dtype=dtype,
+                                                    device=self.device)
+                    kv_caches[layer_name] = gpu_kv_cache
                     kv_cache_shape = self.attn_backend.get_kv_cache_shape(
                         num_blocks, kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
                     dtype = kv_cache_spec.dtype
-                    kv_caches[layer_name] = torch.zeros(kv_cache_shape,
+                    cpu_kv_caches[layer_name] = torch.zeros(kv_cache_shape,
                                                         dtype=dtype,
-                                                        device=self.device)
+                                                        device="cpu",
+                                                        pin_memory=False)
                 else:
                     # TODO: add new branches when introducing more types of
                     # KV cache specs.
                     raise ValueError("Unknown KV cache spec type.")
+        
+        # 先分配后锁页，实际的物理内存占用会小很多
+        for cpu_kv_cache in cpu_kv_caches.values():
+            cpu_kv_cache.pin_memory()
 
         bind_kv_cache(
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
-            self.kv_caches)
+            self.kv_caches,
+            cpu_kv_caches=cpu_kv_caches,
+            runner_cpu_kv_caches=self.cpu_kv_caches,)
+        # 检查 GPU/CPU KV Cache 是否绑定成功
+        assert all(gpu_kv_cache.data_ptr() == kv_.data_ptr() for kv_ in self.kv_caches)
+        assert all(gpu_kv_cache.data_ptr() == s.kv_cache[0].data_ptr() for s in self.vllm_config.compilation_config.static_forward_context.values())
+        assert all(cpu_kv_caches[layer_name].data_ptr() == s.cpu_kv_cache[0].data_ptr() for layer_name, s in self.vllm_config.compilation_config.static_forward_context.items())
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """

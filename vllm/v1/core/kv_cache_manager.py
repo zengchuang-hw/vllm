@@ -33,7 +33,7 @@ class KVCacheManager:
             "kv cache group")
         kv_cache_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = kv_cache_spec.block_size
-        self.num_gpu_blocks = kv_cache_config.num_blocks
+        self.num_cpu_blocks = kv_cache_config.num_cpu_blocks
         self.max_model_len = max_model_len
         self.max_num_blocks_per_req = cdiv(max_model_len, self.block_size)
 
@@ -44,7 +44,7 @@ class KVCacheManager:
         # FIXME: make prefix cache stats conditional on log_stats
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
 
-        self.block_pool = BlockPool(self.num_gpu_blocks, enable_caching)
+        self.block_pool = BlockPool(self.num_cpu_blocks, enable_caching)
         self.specialized_manager = get_specialized_manager(
             kv_cache_spec=kv_cache_spec,
             block_pool=self.block_pool,

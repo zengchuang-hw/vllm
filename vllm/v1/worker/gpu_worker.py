@@ -2,14 +2,14 @@
 """A GPU worker class."""
 import gc
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Dict, Set
 
 import torch
 import torch.distributed
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, CopyMethod, CachePolicy
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
@@ -145,6 +145,16 @@ class Worker(WorkerBase):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    def init_gpu_cache_manager(self, num_gpu_cache_blocks: int, num_cpu_blocks: int, block_size: int, sparse_topk: Optional[int] = None,
+                               copy_method: CopyMethod = CopyMethod.MERGED,
+                               cache_policy: CachePolicy = CachePolicy.LRU_LAYERWISE):
+        self.model_runner.init_gpu_cache_manager(num_gpu_cache_blocks=num_gpu_cache_blocks,
+                                                 num_cpu_blocks=num_cpu_blocks,
+                                                 block_size=block_size,
+                                                 sparse_topk=sparse_topk,
+                                                 copy_method=copy_method,
+                                                 cache_policy=cache_policy)
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.

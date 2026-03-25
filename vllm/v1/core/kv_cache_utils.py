@@ -522,10 +522,10 @@ def check_enough_kv_cache_memory(vllm_config: VllmConfig,
     Raises:
         ValueError: If there is not enough memory available for the KV cache.
     """
-
+    available_memory = vllm_config.cache_config.swap_space_bytes
     if available_memory <= 0:
-        raise ValueError("No available memory for the cache blocks. "
-                         "Try increasing `gpu_memory_utilization` when "
+        raise ValueError("No available memory for the cpu cache blocks. "
+                         "Try increasing `swap_space` when "
                          "initializing the engine.")
 
     max_model_len = vllm_config.model_config.max_model_len
@@ -548,7 +548,7 @@ def check_enough_kv_cache_memory(vllm_config: VllmConfig,
             f"cache is needed, which is larger than the available KV cache "
             f"memory ({available_memory/GiB_bytes:.2f} GiB)."
             f"{estimated_msg} "
-            f" Try increasing `gpu_memory_utilization` or decreasing "
+            f" Try increasing `swap_space` or decreasing "
             f"`max_model_len` when initializing the engine.")
 
 
@@ -600,7 +600,8 @@ def is_kv_cache_type_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
 
 def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
                                       kv_cache_spec: dict[str, KVCacheSpec],
-                                      available_memory: int) -> KVCacheConfig:
+                                      available_memory: int,
+                                      available_cpu_memory: int,) -> KVCacheConfig:
     """
     Generates the KV cache configuration for a model with one type of KV cache.
     Divide the available memory equally among all layers.
@@ -608,7 +609,8 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
     Args:
         vllm_config: The global VllmConfig
         kv_cache_spec: The kv cache spec of each attention layer in the model
-        available_memory: Memory available for KV cache in bytes.
+        available_memory: GPU Memory available for KV cache in bytes.
+        available_cpu_memory: GPU Memory available for KV cache in bytes.
 
     Returns:
         The generated KVCacheConfig
@@ -618,32 +620,38 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
     assert len(page_sizes) == 1
     page_size = page_sizes.pop()
 
-    num_blocks = int(available_memory // page_size // len(kv_cache_spec))
-    num_blocks = max(num_blocks, 0)
+    num_gpu_blocks = int(available_memory // page_size)
+    num_gpu_blocks = max(num_gpu_blocks, 0)
+    
+    num_cpu_blocks = int(available_cpu_memory // page_size // len(kv_cache_spec))
+    num_cpu_blocks = max(num_cpu_blocks, 0)
 
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         num_gpu_blocks_override = \
             vllm_config.cache_config.num_gpu_blocks_override
         logger.info(
             "Overriding num_gpu_blocks=%d with "
-            "num_gpu_blocks_override=%d", num_blocks, num_gpu_blocks_override)
-        num_blocks = num_gpu_blocks_override
+            "num_gpu_blocks_override=%d", num_gpu_blocks, num_gpu_blocks_override)
+        num_gpu_blocks = num_gpu_blocks_override
 
-    num_tokens = num_blocks * vllm_config.cache_config.block_size
+    num_tokens = num_cpu_blocks * vllm_config.cache_config.block_size
     num_tokens_str = f"{num_tokens:,}"
-    logger.info("GPU KV cache size: %s tokens", num_tokens_str)
+    logger.info("CPU KV cache size: %s tokens", num_tokens_str)
+    logger.info(f"Full GPU KV cache size: {num_gpu_blocks * vllm_config.cache_config.block_size // len(kv_cache_spec)} tokens")
+    logger.info(f"GPU block num: {num_gpu_blocks}  CPU block num: {num_cpu_blocks}")
     max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
     max_concurrency = num_tokens / vllm_config.model_config.max_model_len
     logger.info("Maximum concurrency for %s tokens per request: %.2fx",
                 max_model_len_str, max_concurrency)
 
-    per_layer_size = page_size * num_blocks
+    per_layer_size = page_size * num_cpu_blocks
     # All layers have the same KV cache spec, so we create one kv cache group
     # for all layers.
     grouped_layer_names = [list(kv_cache_spec.keys())]
 
     kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
+        num_blocks=num_gpu_blocks,
+        num_cpu_blocks=num_cpu_blocks,
         tensors={
             layer_name: KVCacheTensor(size=per_layer_size)
             for layer_name in kv_cache_spec
@@ -683,7 +691,8 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
 
 def get_kv_cache_config(vllm_config: VllmConfig,
                         kv_cache_spec: dict[str, KVCacheSpec],
-                        available_memory: int) -> KVCacheConfig:
+                        available_memory: int,
+                        available_cpu_memory: int) -> KVCacheConfig:
     """
     Generates the KV cache configuration for a model
     TODO: support hybrid models with more than one type of KV cache.
@@ -691,8 +700,8 @@ def get_kv_cache_config(vllm_config: VllmConfig,
     Args:
         vllm_config: The global VllmConfig
         kv_cache_spec: The kv cache spec of each attention layer in the model
-        available_memory: Memory available for KV cache in bytes.
-
+        available_memory: GPU Memory available for KV cache in bytes.
+        available_cpu_memory: CPU Memory available for KV cache in bytes.
     Returns:
         The generated KVCacheConfigs
     """
@@ -703,7 +712,7 @@ def get_kv_cache_config(vllm_config: VllmConfig,
         # most models. Allocate the same amount of memory for
         # each layer.
         return _get_kv_cache_config_uniform_type(vllm_config, kv_cache_spec,
-                                                 available_memory)
+                                                 available_memory, available_cpu_memory=available_cpu_memory)
 
     raise NotImplementedError
 

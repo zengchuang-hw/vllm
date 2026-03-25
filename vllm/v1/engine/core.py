@@ -38,6 +38,8 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
 
+from vllm.debug_config import DebugConfig, global_debug_config
+
 logger = init_logger(__name__)
 
 POLLING_TIMEOUT_S = 2.5
@@ -72,6 +74,15 @@ class EngineCore:
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
+
+        self.model_executor.init_gpu_cache_manager(
+            num_gpu_cache_blocks=num_gpu_blocks,
+            num_cpu_blocks=num_cpu_blocks,
+            block_size=vllm_config.cache_config.block_size,
+            sparse_topk=vllm_config.cache_config.sparse_topk,
+            copy_method=vllm_config.cache_config.copy_method,
+            cache_policy=vllm_config.cache_config.cache_policy,
+        )
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
@@ -132,7 +143,8 @@ class EngineCore:
         # Get the kv cache tensor size
         kv_cache_configs = [
             get_kv_cache_config(vllm_config, kv_cache_spec_one_worker,
-                                available_gpu_memory_one_worker)
+                                available_gpu_memory_one_worker,
+                                available_cpu_memory=vllm_config.cache_config.swap_space_bytes)
             for kv_cache_spec_one_worker, available_gpu_memory_one_worker in
             zip(kv_cache_specs, available_gpu_memory)
         ]
@@ -149,7 +161,7 @@ class EngineCore:
             for cfg in kv_cache_configs
         ])
         num_gpu_blocks = kv_cache_configs[0].num_blocks
-        num_cpu_blocks = 0
+        num_cpu_blocks = kv_cache_configs[0].num_cpu_blocks
         scheduler_kv_cache_config = kv_cache_configs[0]
 
         # Initialize kv cache and warmup the execution
@@ -200,6 +212,8 @@ class EngineCore:
                 scheduler_stats=self.scheduler.make_stats(),
             )
         scheduler_output = self.scheduler.schedule()
+        if global_debug_config.step_batch:
+            print(f"step batch: {scheduler_output.num_scheduled_tokens}", end=" " if global_debug_config.step_time else "\n")
         output = self.model_executor.execute_model(scheduler_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, output)  # type: ignore
@@ -349,6 +363,8 @@ class EngineCoreProc(EngineCore):
             daemon=True)
         self.output_thread.start()
 
+        self.step_counter = 0
+
     @staticmethod
     def run_engine_core(*args,
                         dp_rank: int = 0,
@@ -433,9 +449,13 @@ class EngineCoreProc(EngineCore):
 
     def _process_engine_step(self):
         """Called only when there are unfinished local requests."""
-
+        start_time = time.perf_counter()
         # Step the engine core.
         outputs = self.step_fn()
+        end_time = time.perf_counter()
+        if global_debug_config.step_time:
+            print(f"step {self.step_counter} time: {(end_time - start_time)*1000:.2f} ms")
+        self.step_counter += 1
         # Put EngineCoreOutputs into the output queue.
         if outputs is not None:
             self.output_queue.put_nowait(outputs)

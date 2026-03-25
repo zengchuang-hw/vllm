@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Attention layer."""
+import time
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -20,6 +21,31 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.platforms import _Backend, current_platform
 from vllm.utils import direct_register_custom_op
+
+from vllm.debug_config import DebugConfig, global_debug_config
+
+from vllm.v1.worker.optimized_swap_blocks import swap_blocks
+
+
+def _extract_layer_index(layer_name: str) -> int:
+    """
+    Extract the layer index from the module name.
+    Examples:
+    - "encoder.layers.0" -> 0
+    - "encoder.layers.1.self_attn" -> 1
+    - "2.self_attn" -> 2
+    - "model.encoder.layers.0.sub.1" -> ValueError
+    """
+    subnames = layer_name.split(".")
+    int_vals: List[int] = []
+    for subname in subnames:
+        try:
+            int_vals.append(int(subname))
+        except ValueError:
+            continue
+    assert len(int_vals) == 1, (f"layer name {layer_name} should"
+                                " only contain one integer")
+    return int_vals[0]
 
 
 class Attention(nn.Module):
@@ -151,14 +177,23 @@ class Attention(nn.Module):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
+        self.layer_idx = _extract_layer_index(layer_name=self.layer_name)
         self.attn_type = attn_type
         # use a placeholder kv cache tensor during init, which will be replaced
         # by bind_kv_cache
         # this variable will not be accessed if use_direct_call is True
+        # GPU KV Cache: 作为缓存使用
         self.kv_cache = [
             torch.tensor([]) for _ in range(get_current_vllm_config(
             ).parallel_config.pipeline_parallel_size)
         ]
+        # CPU KV Cache: 全量 KV Cache
+        self.cpu_kv_cache = [
+            torch.tensor([]) for _ in range(get_current_vllm_config(
+            ).parallel_config.pipeline_parallel_size)
+        ]
+
+        
 
         self.q_range = torch.tensor(envs.Q_SCALE_CONSTANT, dtype=torch.float32)
         self.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
@@ -208,6 +243,8 @@ class Attention(nn.Module):
                 if value is not None:
                     value = value.view(-1, self.num_kv_heads, self.head_size)
             if self.use_direct_call:
+                # TODO(GARRY): 当前只支持 GPU
+                raise NotImplementedError
                 forward_context: ForwardContext = get_forward_context()
                 attn_metadata = forward_context.attn_metadata
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
@@ -220,10 +257,12 @@ class Attention(nn.Module):
                                   output=output)
             else:
                 torch.ops.vllm.unified_attention_with_output(
-                    query, key, value, output, self.layer_name)
+                    query, key, value, output, self.layer_name, self.layer_idx)
             return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:
+                # TODO(GARRY): 当前只支持 GPU
+                raise NotImplementedError
                 forward_context = get_forward_context()
                 attn_metadata = forward_context.attn_metadata
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
@@ -407,21 +446,101 @@ def unified_attention_with_output(
     value: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
+    layer_idx: int,
 ) -> None:
-    wait_for_kv_layer_from_connector(layer_name)
+    # TODO: 与 KV Connector 如何兼容
+    # wait_for_kv_layer_from_connector(layer_name)
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+    if forward_context.gpu_cache_manager is None:
+        # for profile run
+        self.impl.forward(self,
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata,
+                        output=output)
+        return
+
+    cpu_kv_cache = self.cpu_kv_cache[forward_context.virtual_engine]
+
+    forward_context.gpu_cache_manager.layer_prepare(layer_idx=layer_idx, attn_metadata=attn_metadata)
+    # key [num_tokens, num_kv_heads, head_size]
+    # query [num_tokens, num_heads, head_size]
+    
+    # select 和 reshape 操作需等待 swap out 完成
+    forward_context.gpu_cache_manager.kv_swap_out_event.wait(forward_context.gpu_cache_manager.main_stream)
+    selected_logical_blocks_np, selected_logical_block_scores_np, num_selected_blocks = forward_context.gpu_cache_manager.select_topk_naive(attn_metadata=attn_metadata,
+                                                                                                       layer_idx=layer_idx,
+                                                                                                       query=query)
+    
+    # 要将选择的 block 结果同步到 CPU 侧以后, 才能进行 allocate
+    new_attn_metadata, swap_in_mapping, num_swap_in_mapping, swap_out_mapping, num_swap_out_mapping = forward_context.gpu_cache_manager.allocate(layer_idx=layer_idx,
+                                                                                                                                                 selected_logical_block_ids_np=selected_logical_blocks_np,
+                                                                                                                                                 selected_logical_block_scores_np=selected_logical_block_scores_np,
+                                                                                                                                                 num_selected_blocks=num_selected_blocks)
+
+    if global_debug_config.miss_rate:
+        total_num_selected_blocks = 0
+        for i in range(new_attn_metadata.num_seqs):
+            total_num_selected_blocks += num_selected_blocks[i]
+        if total_num_selected_blocks == 0:
+            miss_rate = 0
+        else:
+            miss_rate = num_swap_in_mapping / total_num_selected_blocks
+        if global_debug_config.miss_rate:
+            global_debug_config.miss_rate_avg += miss_rate
+            if layer_idx == forward_context.gpu_cache_manager.num_layers - 1:
+                global_debug_config.miss_rate_avg /= forward_context.gpu_cache_manager.num_layers
+                print(f"Avg miss rate: {global_debug_config.miss_rate_avg * 100} %")
+                global_debug_config.miss_rate_avg = 0.0
+            global_debug_config.log_str += f"layer {layer_idx} swap in {num_swap_in_mapping} / {total_num_selected_blocks} = {miss_rate * 100} %\n"
+    
+    if global_debug_config.hit_log:
+        for i in range(new_attn_metadata.num_seqs):
+            num_selected_blocks_seq = num_selected_blocks[i]
+            global_debug_config.log_str += f"layer {layer_idx} seq {i} select: {selected_logical_blocks_np[i, :num_selected_blocks_seq]}\n"
+    
+    if global_debug_config.print_all_log and layer_idx == forward_context.gpu_cache_manager.num_layers - 1:
+        print(global_debug_config.log_str)
+        global_debug_config.log_str = ""
+
+    if num_swap_in_mapping > 0:
+        with torch.cuda.stream(forward_context.gpu_cache_manager.kv_swap_in_stream):
+            # swap out 的 KV 块写回完毕, 才能开始 swap in, 防止冲突
+            forward_context.gpu_cache_manager.kv_swap_out_event.wait(forward_context.gpu_cache_manager.kv_swap_in_stream)
+            swap_blocks(cpu_kv_cache, kv_cache, swap_in_mapping.narrow(0, 0, num_swap_in_mapping), copy_method=forward_context.gpu_cache_manager.copy_method)
+            # 记录 swap in 事件
+            forward_context.gpu_cache_manager.kv_swap_in_event.record(forward_context.gpu_cache_manager.kv_swap_in_stream)
+
     self.impl.forward(self,
                       query,
                       key,
                       value,
                       kv_cache,
-                      attn_metadata,
-                      output=output)
+                      new_attn_metadata,
+                      output=output,
+                      kv_swap_in_event=forward_context.gpu_cache_manager.kv_swap_in_event,
+                      kv_update_event=forward_context.gpu_cache_manager.kv_cache_update_event,
+                      main_stream=forward_context.gpu_cache_manager.main_stream,)
 
-    maybe_save_kv_layer_to_connector(layer_name, kv_cache)
+    if num_swap_out_mapping > 0:
+        # 在 gen_repr 操作完成之前, swap_in 操作不能开始
+        with torch.cuda.stream(forward_context.gpu_cache_manager.kv_swap_out_stream):
+            # 等待 FlashAttention 将新产生的完整 KV 写入 GPU Cache 块, 才能 swap out
+            forward_context.gpu_cache_manager.kv_cache_update_event.wait(forward_context.gpu_cache_manager.kv_swap_out_stream)
+            # TODO: 优化 swap blocks kernel, 当前会对每个 block 启动 CUDA cudaMemcpyAsync, block 数量太多时, 会造成 GPU 任务队列阻塞
+            swap_blocks(kv_cache, cpu_kv_cache, swap_out_mapping.narrow(0, 0, num_swap_out_mapping), copy_method=forward_context.gpu_cache_manager.copy_method)
+            # 先发射 swap out 操作, 再发射 gen_repr 操作, swap out 可以与 attn 计算并行
+            forward_context.gpu_cache_manager.gen_repr(layer_idx, kv_cache, swap_out_mapping, num_swap_out_mapping)
+            forward_context.gpu_cache_manager.kv_swap_out_event.record(forward_context.gpu_cache_manager.kv_swap_out_stream)
+            # 在 swap_out 操作完成之前, swap_in 操作不能开始
+
+    # TODO: 与 KV Connector 如何兼容
+    # maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
 
 def unified_attention_with_output_fake(
@@ -430,6 +549,7 @@ def unified_attention_with_output_fake(
     value: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
+    layer_idx: int,
 ) -> None:
     return
 

@@ -44,6 +44,7 @@ class ForwardContext:
     virtual_engine: int  # set dynamically for each forward pass
     # set dynamically for each forward pass
     dp_metadata: Optional[DPMetadata] = None
+    gpu_cache_manager: Any = None
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -60,6 +61,7 @@ def get_forward_context() -> ForwardContext:
 @contextmanager
 def set_forward_context(attn_metadata: Any,
                         vllm_config: VllmConfig,
+                        gpu_cache_manager = None,
                         virtual_engine: int = 0,
                         num_tokens: int = 0):
     """A context manager that stores the current forward context,
@@ -97,11 +99,11 @@ def set_forward_context(attn_metadata: Any,
     global _forward_context
     prev_context = _forward_context
     _forward_context = ForwardContext(
-        no_compile_layers=vllm_config.compilation_config.
-        static_forward_context,
+        no_compile_layers=vllm_config.compilation_config.static_forward_context,
         virtual_engine=virtual_engine,
         attn_metadata=attn_metadata,
-        dp_metadata=dp_metadata)
+        dp_metadata=dp_metadata,
+        gpu_cache_manager=gpu_cache_manager)
 
     # KVConnector: trigger (possibly async) load before forward.
     # Each attn layer will block until the reading is complete.

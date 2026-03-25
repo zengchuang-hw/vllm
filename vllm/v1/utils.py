@@ -6,7 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from multiprocessing import Process
 from typing import (TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar,
-                    Union, overload)
+                    Union, overload, List, Dict)
 
 import torch
 
@@ -151,6 +151,8 @@ def bind_kv_cache(
     kv_caches: dict[str, torch.Tensor],
     forward_context: dict[str, "Attention"],
     runner_kv_caches: list[torch.Tensor],
+    cpu_kv_caches: Optional[Dict[str, torch.Tensor]] = None,
+    runner_cpu_kv_caches: Optional[List[torch.Tensor]] = None,
 ) -> None:
     """
     Bind the allocated KV cache to both ModelRunner and forward context so
@@ -167,6 +169,8 @@ def bind_kv_cache(
         forward_context: The global forward context containing all Attention 
         layers with layer names as keys.
         runner_kv_caches: The kv_cache declared by ModelRunner.
+        cpu_kv_caches: The allocated cpu kv_caches with layer names as keys.
+        runner_cpu_kv_caches: The cpu kv_cache declared by ModelRunner.
     """
     # Bind kv_caches to ModelRunner
     assert len(runner_kv_caches) == 0
@@ -185,11 +189,16 @@ def bind_kv_cache(
             raise NotImplementedError
         layer_name = layer_names[0]
         runner_kv_caches.append(kv_caches[layer_name])
+        if cpu_kv_caches is not None and runner_cpu_kv_caches is not None:
+            runner_cpu_kv_caches.append(cpu_kv_caches[layer_name])
 
     # Bind kv_caches to forward context
     for layer_name, kv_cache in kv_caches.items():
         # NOTE: Use list because of v0 PP virtual engine.
         forward_context[layer_name].kv_cache = [kv_cache]
+
+    for layer_name, cpu_kv_cache in cpu_kv_caches.items():
+        forward_context[layer_name].cpu_kv_cache = [cpu_kv_cache]
 
 
 def copy_slice(from_tensor: torch.Tensor, to_tensor: torch.Tensor,

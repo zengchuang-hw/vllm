@@ -44,6 +44,7 @@ from vllm.transformers_utils.utils import is_s3, maybe_model_redirect
 from vllm.utils import (GiB_bytes, LayerBlockType, cuda_device_count_stateless,
                         get_cpu_memory, get_open_port, is_torch_equal_or_newer,
                         random_uuid, resolve_obj_by_qualname)
+from enum import Enum
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -1287,10 +1288,26 @@ class ModelConfig:
         return getattr(self.hf_config, "matryoshka_dimensions", None)
 
 
-BlockSize = Literal[1, 8, 16, 32, 64, 128]
+BlockSize = Literal[1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 CacheDType = Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2"]
 PrefixCachingHashAlgo = Literal["builtin", "sha256"]
 
+# CPU <-> GPU 之间的 KV Cache 拷贝方法
+class CopyMethod(Enum):
+    NON_MERGED = "non-merged"  # 不合并连续块, vLLM 原有方法
+    MERGED = "merged"  # 合并连续块
+    TORCH = "torch"  # 使用 torch.copy() 拷贝
+    GATHER_SCATTER = "gather-scatter"  # 使用 Gather-Scatter 拷贝
+    CUSTOM = "custom"  # 使用自定义的拷贝函数
+
+
+# GPU 缓存替换策略
+class CachePolicy(Enum):
+    LRU = "lru"  # 最近最少使用
+    LFU = "lfu"  # 最近最频繁使用
+    HOT_SCORE = "hot-score"  # 热点得分
+    LRU_LAYERWISE = "lru-layerwise"  # 层间独立最近最少使用
+    LRU_WITH_HOT_SCORE = "lru-hot-score"  # 层级最近最少使用 + 热点得分
 
 @config
 @dataclass
@@ -1328,6 +1345,9 @@ class CacheConfig:
     sliding_window: Optional[int] = None
     """Sliding window size for the KV cache. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
+    sparse_topk: Optional[int] = None
+    """Sparse attention parameter:
+    the maximum number of tokens selected to participate in the Attention each layer"""
     enable_prefix_caching: Optional[bool] = None
     """Whether to enable prefix caching. Disabled by default for V0. Enabled by
     default for V1."""
@@ -1354,6 +1374,12 @@ class CacheConfig:
     """The number of blocks to allocate for GPU memory."""
     num_cpu_blocks: Optional[int] = field(default=None, init=False)
     """The number of blocks to allocate for CPU memory."""
+
+    copy_method: CopyMethod = CopyMethod.MERGED
+    """CPU<->GPU swap blocks method"""
+
+    cache_policy: CachePolicy = CachePolicy.LRU_LAYERWISE
+    """GPU Hot Cache Policy: lru, lfu, hot-score, lru-layerwise, lru-hot-score"""
 
     def compute_hash(self) -> str:
         """

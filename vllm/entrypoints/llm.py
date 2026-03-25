@@ -44,6 +44,8 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import (Counter, Device, deprecate_args, deprecate_kwargs,
                         is_list_of)
 
+import time
+
 logger = init_logger(__name__)
 
 _R = TypeVar("_R", default=Any)
@@ -1420,7 +1422,10 @@ class LLM:
         total_in_toks = 0
         total_out_toks = 0
         while self.llm_engine.has_unfinished_requests():
+            start_time = time.perf_counter()
             step_outputs = self.llm_engine.step()
+            end_time = time.perf_counter()
+            # print(f"step time: {(end_time - start_time)*1000}ms")
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)

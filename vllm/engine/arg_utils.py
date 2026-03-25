@@ -25,7 +25,7 @@ from vllm.config import (BlockSize, CacheConfig, CacheDType, CompilationConfig,
                          PrefixCachingHashAlgo, PromptAdapterConfig,
                          SchedulerConfig, SchedulerPolicy, SpeculativeConfig,
                          TaskOption, TokenizerPoolConfig, VllmConfig,
-                         get_attr_docs, get_field)
+                         get_attr_docs, get_field, CopyMethod, CachePolicy)
 from vllm.executor.executor_base import ExecutorBase
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
@@ -340,6 +340,11 @@ class EngineArgs:
     enable_reasoning: Optional[bool] = None
     reasoning_parser: Optional[str] = DecodingConfig.reasoning_backend
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
+
+    sparse_topk: Optional[int] = None
+
+    copy_method: str = "merged"
+    cache_policy: str = "lru-layerwise"
 
     def __post_init__(self):
         if not self.tokenizer:
@@ -962,6 +967,29 @@ class EngineArgs:
             "Note that even if this is set to False, cascade attention will be "
             "only used when the heuristic tells that it's beneficial.")
 
+        parser.add_argument(
+            "--sparse-topk",
+            default=10240000,
+            type=int,
+            help="Sparse attention parameter: the maximum number of tokens selected to participate in the Attention each layer"
+        )
+
+        parser.add_argument(
+            "--copy-method",
+            default="merged",
+            type=str,
+            choices=[method.value for method in CopyMethod],
+            help="CPU<->GPU Swap blocks methods: non-merged(original method), merged(merge contiguous blocks), torch(use torch.copy())"
+        )
+
+        parser.add_argument(
+            "--cache-policy",
+            default="lru",
+            type=str,
+            choices=[policy.value for policy in CachePolicy],
+            help="GPU Hot Cache Policy"
+        )
+
         return parser
 
     @classmethod
@@ -1131,10 +1159,13 @@ class EngineArgs:
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=model_config.get_sliding_window(),
+            sparse_topk=self.sparse_topk,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             cpu_offload_gb=self.cpu_offload_gb,
             calculate_kv_scales=self.calculate_kv_scales,
+            copy_method=CopyMethod(self.copy_method),
+            cache_policy=CachePolicy(self.cache_policy),
         )
 
         # Get the current placement group if Ray is initialized and

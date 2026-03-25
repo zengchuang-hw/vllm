@@ -139,7 +139,11 @@ class KVCacheConfig:
     The KV cache configuration of a model.
     """
     """The number of KV cache blocks"""
+    # 将 GPU KV Cache blocks 作为缓存使用，这里的 num_gpu_blocks 是总块数，不再为每一层独立分配
     num_blocks: int
+    """The number of CPU KV cache blocks"""
+    # CPU 上存放全量的 KV Cache Block，结构与原本的 GPU blocks 相同，这里的 num_cpu_blocks 是每一层的 KV 块数
+    num_cpu_blocks: int
     """layer_name -> how to initialize KV cache for that layer"""
     tensors: dict[str, KVCacheTensor]
     """
